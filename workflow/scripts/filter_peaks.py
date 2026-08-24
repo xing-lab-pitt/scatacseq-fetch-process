@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--out", required=True, help="filtered narrowPeak output")
     ap.add_argument("--blacklist", default="",
                     help="BED of blacklisted regions; empty disables the filter")
+    ap.add_argument("--genome-fai", default="",
+                    help="samtools .fai for the genome the peaks were called on. "
+                         "Used to verify the blacklist belongs to this genome.")
     ap.add_argument("--primary-chroms-only", action="store_true",
                     help="keep only chr1-22, chrX, chrY (drops chrM + scaffolds)")
     ap.add_argument("--report", default="", help="optional TSV summary")
@@ -116,6 +119,29 @@ def main():
                 "(hg38-blacklist.v2 uses the 'chr' prefix).",
                 file=sys.stderr)
             sys.exit(1)
+
+        # Sharing SOME contig names is not enough. hg38 and mm10 both use
+        # chr1-chr19, chrX and chrY, so a human blacklist against mouse peaks
+        # passes the check above, then drops the wrong ~9,000 peaks while leaving
+        # the real artifacts in place. Compare against the genome's own contig
+        # list instead: a blacklist naming chr20 is not an mm10 blacklist.
+        if args.genome_fai and Path(args.genome_fai).exists():
+            genome_chroms = {l.split("\t")[0]
+                             for l in Path(args.genome_fai).read_text().splitlines()
+                             if l.strip()}
+            alien = sorted(set(black["chrom"].astype(str)) - genome_chroms)
+            if alien:
+                print(
+                    f"Blacklist does not belong to this genome.\n"
+                    f"  blacklist : {bl_path}\n"
+                    f"  genome    : {args.genome_fai}\n"
+                    f"  {len(alien)} blacklist contig(s) absent from the genome, "
+                    f"e.g. {alien[:5]}\n"
+                    "Sharing chr1-chr19/chrX/chrY is not evidence of a match -- "
+                    "human and mouse share those names. Point "
+                    "references.<genome>.blacklist at the right file.",
+                    file=sys.stderr)
+                sys.exit(1)
 
         hit = overlaps_blacklist(peaks, black)
         dropped["blacklisted"] = int(hit.sum())

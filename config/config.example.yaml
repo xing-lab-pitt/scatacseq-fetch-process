@@ -7,8 +7,7 @@
 # <PLACEHOLDER> with a path on YOUR system. config/config.yaml is gitignored so
 # your local paths are never committed.
 #
-# The values shown in comments marked "capricorn:" are the working values on the
-# pipeline author's cluster — copy them if you are on that machine.
+# Lines marked "example:" show the shape of a real path, not a path that exists.
 # ---------------------------------------------------------------------------
 
 # Sample sheet from workflow/scripts/prepare_runs.py (or hand-written).
@@ -16,8 +15,8 @@
 #          r1_url  r2_url  r3_url  r1_md5  r2_md5  r3_md5
 #   r1 = genomic read 1, r2 = CELL BARCODE read (16 bp), r3 = genomic read 2.
 #   source   : ena | sra   (per-run; ENA first, SRA fallback)
-#   modality : 10x         (multiome is NOT supported in this pass — see README)
-#   genome   : GRCh38      (mm10 is a config change, not a code change)
+#   modality : 10x | multiome | unknown  ("unknown" = let the reads decide)
+#   genome   : GRCh38 | mm10             (set from the organism by prepare_runs.py)
 samples_tsv: "config/samples.tsv"
 
 # Where FASTQs, fragments, matrices and reports are written. One dir per study.
@@ -39,12 +38,11 @@ sra_tools_bin: ""
 # ATAC FASTQs are large (~30-80 GB per 10x sample). check_versions.py aborts the
 # run before any download if the workdir's filesystem has less than this free.
 # Set it to roughly (number of samples x 100 GB) for a comfortable margin.
-# Preflight aborts below this. BUDGET FOR THE UNCOMPRESSED STAGE, not the
-# download: fasterq-dump writes plain FASTQ and the pipeline then gzips it, so
-# peak usage is both at once. Measured on a 739M-spot run: 332 GB uncompressed,
-# ~430-530 GB peak. 500 covers one such sample; the SLURM profile caps
-# concurrent downloads at 1 so this is a per-sample figure, not a per-study one.
-min_free_gb: 500
+# Preflight aborts below this. Extraction happens on node-local $SCATAC_STAGE_ROOT
+# (default /scratch), so the ~500 GB peak does NOT land here -- only the finished
+# FASTQ does, ~200 GB for a 739M-spot run. 300 covers one such sample with margin;
+# the SLURM profile caps concurrent downloads at 1, so this is per-sample.
+min_free_gb: 300
 
 # Delete each run's raw FASTQ as soon as chromap has consumed it (Snakemake
 # temp()). The fragment file is the durable artifact, not the reads. Set true
@@ -64,7 +62,7 @@ compress_fastq: false
 # download for a single ATAC run can take hours, so a bad path should cost a
 # second, not a night.
 #
-# capricorn values are shown; replace <PLACEHOLDER> elsewhere.
+# Replace every <PLACEHOLDER>. See README "Reference data" for where to get these.
 references:
   GRCh38:
     # example: /refs/GRCh38/fasta/genome.fa
@@ -97,7 +95,7 @@ barcodes:
   # copied from repos/scATACpipe/assets/whitelist_barcodes/737K-cratac-v1.txt.gz
   # example: "/refs/10x_whitelists/737K-cratac-v1.txt"
   whitelist_10x: "<PLACEHOLDER>/737K-cratac-v1.txt"
-  # 10x Multiome ARC *ATAC* whitelist. Unused in this pass (multiome is refused).
+  # 10x Multiome ARC *ATAC* whitelist. Required for multiome samples.
   #
   # WARNING: Cell Ranger ARC ships TWO DIFFERENT FILES both named
   # 737K-arc-v1.txt -- lib/python/atac/barcodes/ (ATAC) and
@@ -166,15 +164,18 @@ read_qc:
 # to build a first-pass matrix. Peak calling is population-dependent, so
 # per-cluster pseudobulk recalling belongs downstream (scATACpipe's point).
 peaks:
-  # ENCODE blacklist (Amemiya et al., Sci Rep 2019): regions that produce high
-  # signal in ANY ChIP/ATAC experiment regardless of biology -- collapsed
-  # repeats, centromeric satellite, low-mappability. Peaks there are artifacts.
-  # hg38 v2 = 636 regions / 227 Mb. Ships with scATACpipe
-  # (assets/hg38-blacklist.v2.bed.gz). Set "" to disable.
-  # MUST use the same contig naming as your reference -- filter_peaks.py refuses
-  # on a mismatch rather than silently filtering nothing.
-  # example: "/refs/blacklists/hg38-blacklist.v2.bed"
-  blacklist: "<PLACEHOLDER>/hg38-blacklist.v2.bed"
+  # SET THE BLACKLIST PER GENOME, under references.<genome>.blacklist above.
+  #
+  # This key is a global fallback kept for single-genome configs. Leave it empty
+  # unless you have exactly one genome. A path here applies to EVERY genome, and
+  # an hg38 path used on a mouse run does not look like an error: human and mouse
+  # share the contig names chr1-chr19, chrX and chrY, so the naming check passes
+  # and the wrong regions get filtered. That happened -- it dropped 9,230 real
+  # mouse peaks and kept 1,889 genuinely blacklisted ones.
+  #
+  # references.<genome>.blacklist wins over this when both are set, and the run
+  # prints which one it used.
+  blacklist: ""
   # Keep only chr1-22, chrX, chrY. Drops unplaced scaffolds and chrM -- neither
   # is interpretable as a regulatory element.
   primary_chroms_only: true

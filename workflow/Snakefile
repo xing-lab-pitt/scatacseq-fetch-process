@@ -23,6 +23,7 @@
 #   reads, so it is not redundant with chromap's internal trimming.
 # =============================================================================
 import re
+import sys
 
 import pandas as pd
 from pathlib import Path
@@ -152,8 +153,21 @@ elif "reference" not in config:
 # else: legacy single 'reference:' block, used as-is for this one genome.
 
 # peaks.blacklist may live in the per-genome block; the peaks block wins if set.
-if config["reference"].get("blacklist") and not config.get("peaks", {}).get("blacklist"):
-    config.setdefault("peaks", {})["blacklist"] = config["reference"]["blacklist"]
+# The per-genome blacklist WINS over a global peaks.blacklist. It used to defer
+# to it, which is backwards: the genome-specific value is the more specific one.
+# A config carrying both -- a leftover global hg38 path plus a correct
+# references.mm10.blacklist -- then filtered mouse peaks against the human
+# blacklist. It did not look like an error, because hg38 and mm10 share the
+# names chr1-chr19, chrX and chrY, so the contig check found plenty in common.
+_bl = config["reference"].get("blacklist")
+if _bl:
+    _global_bl = config.get("peaks", {}).get("blacklist")
+    if _global_bl and str(_global_bl) != str(_bl):
+        print(f"[scatac] genome={GENOME}: using references.{GENOME}.blacklist\n"
+              f"           {_bl}\n"
+              f"         overriding peaks.blacklist\n"
+              f"           {_global_bl}", file=sys.stderr)
+    config.setdefault("peaks", {})["blacklist"] = _bl
 
 # Fail now, not after the download, if the reference files are not really there.
 _missing = [f"{k}: {config['reference'][k]}"
@@ -681,11 +695,19 @@ rule macs3_peaks:
 rule filter_peaks:
     input:
         peaks=PEAKS / "{sample}_peaks.narrowPeak",
+        # The blacklist is an INPUT, not just a param, so replacing the file
+        # reruns this rule. It was a param only, and swapping a 164-region mm10
+        # list for the 3,435-region v2 changed nothing until the outputs were
+        # deleted by hand -- a stale filtered peak set that looks current.
+        # Empty list when no blacklist is configured, so filtering stays optional.
+        blacklist=([PK["blacklist"]] if PK.get("blacklist") else []),
     output:
         peaks=PEAKS / "{sample}_peaks.filtered.narrowPeak",
         report=QC / "peaks" / "{sample}.peak_filter.tsv",
     params:
         blacklist=PK.get("blacklist", ""),
+        # Lets filter_peaks confirm the blacklist belongs to THIS genome.
+        fai=config["reference"]["fasta"] + ".fai",
         primary=("--primary-chroms-only" if PK.get("primary_chroms_only", True) else ""),
         script=f"{SCRIPTS}/filter_peaks.py",
     shell:
@@ -694,6 +716,7 @@ rule filter_peaks:
             --peaks {input.peaks} \
             --out {output.peaks} \
             --blacklist "{params.blacklist}" \
+            --genome-fai "{params.fai}" \
             --report {output.report} \
             {params.primary}
         """

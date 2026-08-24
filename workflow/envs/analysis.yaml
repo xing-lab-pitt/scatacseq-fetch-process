@@ -1,0 +1,14 @@
+# Python environment for the matrix + QC steps.
+# Versions match requirements-pipeline.txt so the pipeline and the analysis
+# stack never diverge; check_versions.py enforces the pins at preflight.
+#
+# NOT USED ON THE AUTHOR'S CLUSTER -- see the note in tools.yaml.
+name: scatacseq-analysis
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+    - -r ../../requirements-pipeline.txt

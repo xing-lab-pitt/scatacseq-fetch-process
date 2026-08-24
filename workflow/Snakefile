@@ -1,0 +1,858 @@
+# =============================================================================
+# scATAC-seq end-to-end (Snakemake)
+#   preflight version + disk check
+#   FASTQ download (3 reads: 2 genomic + 1 barcode)  ->  FastQC
+#   chromap index (once, version-matched)
+#   barcode orientation detection (forward vs reverse-complement, empirical)
+#   chromap --preset atac  (trim + map + barcode-correct + dedup + Tn5 shift)
+#       -> fragments.tsv.gz + .tbi  (the durable artifact)
+#   MACS3 provisional peaks -> snapATAC2 peak x cell matrix + TSS/nucleosome QC
+#   deterministic QC gate (fixed thresholds)  ->  MultiQC report
+#   per-sample .h5ad -> merged .h5ad
+#
+# Sample sheet is produced once:
+#   python workflow/scripts/prepare_runs.py GSE1234 -o config/samples.tsv
+# then:  snakemake -n   and   sbatch run_slurm.sh
+#
+# WHY THERE IS NO TRIM RULE AND NO BAM:
+#   chromap --preset atac folds adapter trimming, paired-end mapping, barcode
+#   correction, cell-level PCR deduplication and the Tn5 +4/-5 coordinate shift
+#   into ONE pass, emitting the fragment file directly. Verified against MAESTRO
+#   and scATACpipe: both carry a separate trim step only on their non-chromap
+#   (bwa/bowtie2) paths. FastQC here is a pure diagnostic and does not modify
+#   reads, so it is not redundant with chromap's internal trimming.
+# =============================================================================
+import re
+
+import pandas as pd
+from pathlib import Path
+
+configfile: "config/config.yaml"
+
+SCRIPTS = Path(workflow.basedir) / "scripts"
+WORK  = Path(config["workdir"])
+FASTQ = WORK / "fastq"
+FRAG  = WORK / "fragments"
+PEAKS = WORK / "peaks"
+H5AD  = WORK / "h5ad"
+QC    = WORK / "qc"
+# The index the aligner consumes is always this pipeline-owned path (produced by
+# rule resolve_chromap_index), never config's chromap_index directly.
+CHROMAP_INDEX = WORK / "chromap_index"
+
+samples = pd.read_csv(config["samples_tsv"], sep="\t", dtype=str).fillna("")
+
+# Back-compat: sheets written before the SRA fallback have no `source` column.
+if "source" not in samples.columns:
+    samples["source"] = "ena"
+# Back-compat: sheets written before multi-modality support.
+if "modality" not in samples.columns:
+    samples["modality"] = "10x"
+if "genome" not in samples.columns:
+    samples["genome"] = "GRCh38"
+samples["source"] = samples["source"].replace("", "ena")
+samples["modality"] = samples["modality"].replace("", "10x")
+
+# ---------------------------------------------------------------------------
+# MODALITY. 10x Multiome is supported: the ATAC and GEX libraries carry different
+# barcode sequences for the same gel bead, corresponding by line number across
+# the two ARC whitelists, so chromap is given a translation table built from
+# them. Ran end to end on GSE219015 (mouse, mm10): 8,755 cells, 96.8% of reads
+# mapped.
+# ---------------------------------------------------------------------------
+# "unknown" means prepare_runs.py could not tell from the metadata and is not
+# guessing. It is a legal value: detect_barcode_orientation probes both
+# chemistries against the reads, so the measurement decides. Writing "10x" when
+# nothing was found would state a guess as a fact, and downstream cannot tell
+# the difference between that and a confirmed value.
+KNOWN_MODALITIES = {"10x", "multiome", "unknown"}
+_unknown = sorted(set(samples["modality"]) - KNOWN_MODALITIES)
+if _unknown:
+    raise ValueError(
+        f"samples.tsv contains unknown modality {_unknown}. "
+        f"Supported: {sorted(KNOWN_MODALITIES)}."
+    )
+
+# Multiome machinery is IMPLEMENTED but NOT YET VERIFIED on real multiome data.
+# The failure it guards against is silent: a wrong --barcode-translate table
+# still produces a complete, well-formed, QC-passing object that is keyed to the
+# wrong cells. So it stays opt-in behind an explicit flag until someone has run
+# GSE219015 and asserted that the ATAC and GEX objects share obs_names.
+# See M5_MULTIOME_PLAN.md section 5.
+_multiome = sorted(set(samples.loc[samples["modality"] == "multiome", "sample"]))
+if _multiome and not config.get("allow_unverified_multiome", False):
+    raise ValueError(
+        f"samples.tsv contains multiome samples {_multiome[:3]}"
+        f"{' ...' if len(_multiome) > 3 else ''}.\n"
+        "The multiome path (ARC barcode translation + MuData pairing) is "
+        "implemented but has NOT been verified end-to-end on real multiome data. "
+        "A wrong translation table yields a well-formed object keyed to the wrong "
+        "cells -- it will not look like an error.\n"
+        "To run it anyway, set in config.yaml:\n"
+        "    allow_unverified_multiome: true\n"
+        "and then CHECK that the ATAC and GEX objects share obs_names before "
+        "trusting any result (see M5_MULTIOME_PLAN.md section 5)."
+    )
+
+# Run IDs must match the srr wildcard constraint below ([A-Za-z0-9]+). Real
+# SRA/ENA/DDBJ accessions always do, but a hand-written sheet may not -- and the
+# failure mode without this check is a MissingInputException naming a FASTQ that
+# "does not exist", which sends you looking at the filesystem instead of at the
+# sheet. Caught the hard way with run ids like "10p_L001".
+_bad_srr = [s for s in samples["srr"] if not re.fullmatch(r"[A-Za-z0-9]+", str(s))]
+if _bad_srr:
+    raise ValueError(
+        f"samples.tsv has run id(s) that are not alphanumeric: {_bad_srr[:5]}"
+        f"{' ...' if len(_bad_srr) > 5 else ''}.\n"
+        "The `srr` column must match [A-Za-z0-9]+ (no underscores, dots or "
+        "dashes) because it is used as a Snakemake wildcard. Real SRR/ERR/DRR "
+        "accessions satisfy this; hand-written sheets often do not.\n"
+        "Use the accession itself, or a plain alphanumeric label."
+    )
+
+# ---------------------------------------------------------------------------
+# GENOME RESOLUTION -- one genome per run, resolved BEFORE anything downloads.
+#
+# The `genome` column used to be parsed and then silently ignored: every rule
+# read a single global config["reference"], so a sheet of mm10 rows would be
+# aligned against whatever reference the config happened to name. Low mapping
+# rate, near-zero fragments, and the failure would surface as a barcode problem.
+#
+# MIXED GENOMES ARE REFUSED. merge_h5ad builds a union-of-peaks object, and a
+# human+mouse union is not a meaningful artifact -- it is one nobody should use.
+# Splitting the sheet by genome is one command; producing a nonsense object is
+# not recoverable by inspection.
+#
+# Resolution happens at PARSE TIME, before the first byte is downloaded, so a
+# missing or mistyped genome costs a second rather than hours of SRA transfer.
+_genomes = sorted(set(str(g).strip() for g in samples["genome"] if str(g).strip()))
+if len(_genomes) > 1:
+    raise ValueError(
+        f"samples.tsv mixes genomes: {_genomes}.\n"
+        "One run handles ONE genome. The merged object is a union of peak sets, "
+        "which is meaningless across species.\n"
+        "Split the sheet by genome and run each separately, e.g.:\n"
+        "  awk -F'\\t' 'NR==1||$5==\"GRCh38\"' samples.tsv > samples.GRCh38.tsv"
+    )
+GENOME = _genomes[0] if _genomes else "GRCh38"
+
+# config may carry either the new per-genome mapping or the old single block.
+if "references" in config:
+    if GENOME not in config["references"]:
+        raise ValueError(
+            f"samples.tsv uses genome={GENOME!r}, but config 'references:' has "
+            f"only {sorted(config['references'])}.\n"
+            f"Add a references.{GENOME} block (fasta, gtf, chromap_index, gsize, "
+            "blacklist)."
+        )
+    config["reference"] = dict(config["references"][GENOME])
+elif "reference" not in config:
+    raise ValueError("config has neither 'references:' (per-genome) nor "
+                     "'reference:' (single genome).")
+# else: legacy single 'reference:' block, used as-is for this one genome.
+
+# peaks.blacklist may live in the per-genome block; the peaks block wins if set.
+if config["reference"].get("blacklist") and not config.get("peaks", {}).get("blacklist"):
+    config.setdefault("peaks", {})["blacklist"] = config["reference"]["blacklist"]
+
+# Fail now, not after the download, if the reference files are not really there.
+_missing = [f"{k}: {config['reference'][k]}"
+            for k in ("fasta", "gtf")
+            if config["reference"].get(k) and not Path(config["reference"][k]).exists()]
+if config.get("peaks", {}).get("blacklist") and \
+        not Path(config["peaks"]["blacklist"]).exists():
+    _missing.append(f"blacklist: {config['peaks']['blacklist']}")
+if _missing:
+    raise ValueError(
+        f"genome={GENOME}: reference file(s) not found:\n  " + "\n  ".join(_missing)
+        + "\nChecked at parse time deliberately -- an SRA download for one ATAC "
+          "run can take hours, so a bad path should cost a second, not a night."
+    )
+
+print(f"[scatac] genome={GENOME}  fasta={config['reference']['fasta']}")
+
+RUN = samples.set_index("srr")
+SAMPLE_RUNS = samples.groupby("sample")["srr"].apply(list).to_dict()
+SAMPLES = sorted(SAMPLE_RUNS)
+ALL_SRR = list(samples["srr"])
+
+BC   = config["barcodes"]
+QCC  = config["qc"]
+PK   = config.get("peaks", {})
+RQC  = config.get("read_qc", {})
+
+# Raw FASTQs are large (~30-80 GB per 10x ATAC sample) and the fragment file is
+# the durable artifact, so by default Snakemake deletes them once chromap has
+# consumed them. keep_fastq: true opts out.
+# RETENTION AND COMPRESSION ARE SEPARATE DECISIONS.
+#
+# keep_fastq      whether the raw FASTQs survive after chromap consumes them
+# compress_fastq  whether they are gzipped on the way out
+#
+# These were one flag, which forced a choice nobody wants: keep the files and pay
+# hours of compression, or skip compression and lose them. A verification run
+# needs to keep the files so their output can be checked, and needs them fast.
+#
+# compress_fastq defaults to keep_fastq so configs written before the split
+# behave exactly as they did.
+_keep = bool(config.get("keep_fastq", False))
+_compress = bool(config.get("compress_fastq", _keep))
+maybe_temp = (lambda p: p) if _keep else temp
+
+# fasterq-dump writes plain FASTQ. Compressing it costs hours (~460 GB took ~5 h)
+# and chromap reads plain FASTQ perfectly well, so compression only earns its
+# time when the files are being kept for a while and disk is the binding
+# constraint. Keeping them uncompressed for a few days is usually the better
+# trade.
+#
+# WHY THE FILES LIVE IN THE WORKDIR AND NOT ON /scratch:
+# download_fastq and chromap are separate Snakemake rules, hence separate SLURM
+# jobs, which SLURM may place on DIFFERENT NODES. /scratch is node-local, so
+# chromap could not see files left there. Only fasterq-dump's internal SORT TEMP
+# goes to /scratch -- that never has to outlive the job.
+FQ_EXT = ".fastq.gz" if _compress else ".fastq"
+
+
+def whitelist_for(sample):
+    """Base whitelist for a sample's modality (orientation resolved later).
+
+    modality=unknown gets the 10x list as --whitelist and the ARC list as
+    --whitelist-alt; the detector probes both and swaps them if the reads say
+    multiome. Which one starts in which slot does not matter, only that they
+    differ.
+    """
+    modality = RUN.loc[SAMPLE_RUNS[sample][0], "modality"]
+    if modality == "multiome":
+        # The ARC *ATAC* list. Passing the GEX list here yields a run that
+        # completes but is keyed wrongly -- see M5_MULTIOME_PLAN.md section 2.
+        return BC["whitelist_multiome_atac"]
+    return BC["whitelist_10x"]
+
+
+def modality_for(sample):
+    return RUN.loc[SAMPLE_RUNS[sample][0], "modality"]
+
+
+wildcard_constraints:
+    srr=r"[A-Za-z0-9]+",
+    sample=r"[^/]+",
+
+
+rule all:
+    input:
+        WORK / "combined.h5ad",
+        QC / "multiqc_report.html",
+        QC / "qc_ok.txt",
+        QC / "read_qc.tsv",
+
+# ------------------------------ preflight ------------------------------------
+# Verifies tool + Python pins AND that the workdir filesystem has enough free
+# space. The disk check matters here in a way it does not for scRNA: this
+# cluster's home mount runs at 99% capacity, and an unguarded multi-sample ATAC
+# study can fill it and break other users' jobs.
+rule check_versions:
+    output:
+        touch(WORK / ".versions_ok"),
+    params:
+        req=config["requirements_txt"],
+        workdir=str(WORK),
+        min_free_gb=config.get("min_free_gb", 0),
+        script=f"{SCRIPTS}/check_versions.py",
+    shell:
+        "python {params.script} {params.req} "
+        "--check-dir {params.workdir} --min-free-gb {params.min_free_gb}"
+
+# ------------------------------ reference ------------------------------------
+# The index the aligner uses is a PIPELINE OUTPUT (CHROMAP_INDEX), never the
+# hand-supplied artifact directly. One principle, inherited from the scRNA
+# pipeline's resolve_star_index: the index and the aligner must come from the
+# same environment. The resolver validates a supplied index against the running
+# chromap and rebuilds on mismatch, so a version mismatch is impossible by
+# construction — the chromap rule can only read CHROMAP_INDEX.
+rule resolve_chromap_index:
+    input:
+        versions=WORK / ".versions_ok",
+    output:
+        CHROMAP_INDEX,
+    threads: config["threads"]
+    resources:
+        mem_mb=64000,
+    params:
+        supplied=config["reference"].get("chromap_index", ""),
+        fasta=config["reference"]["fasta"],
+        script=f"{SCRIPTS}/resolve_chromap_index.py",
+    shell:
+        r"""
+        python {params.script} \
+            --out {output} \
+            --supplied "{params.supplied}" \
+            --fasta "{params.fasta}"
+        """
+
+# ---------------------- ARC barcode translation (multiome) -------------------
+# 10x Multiome only. The ATAC and GEX libraries carry DIFFERENT barcode sequences
+# for the same gel bead, corresponding only by line number across the two ARC
+# whitelists (verified: 736,320 entries each, 0 shared, not a revcomp
+# relationship). chromap --barcode-translate rekeys ATAC fragments to the GEX
+# barcode so the two modalities can be joined on obs_names.
+rule resolve_arc_translation:
+    output:
+        table=WORK / "arc_translation.tsv",
+    params:
+        atac=BC.get("whitelist_multiome_atac", ""),
+        gex=BC.get("whitelist_multiome_gex", ""),
+        script=f"{SCRIPTS}/resolve_arc_translation.py",
+    shell:
+        r"""
+        python {params.script} \
+            --atac-whitelist "{params.atac}" \
+            --gex-whitelist "{params.gex}" \
+            -o {output.table}
+        """
+
+# ------------------------------ download -------------------------------------
+# Three reads per run, not two:
+#   r1 = genomic read 1, r2 = CELL BARCODE read (16 bp), r3 = genomic read 2.
+# Submitter naming varies (R1/R2/R3 vs R1/R2/I2 vs R1/I1/R2), so prepare_runs.py
+# resolves which URL is which BY READ LENGTH, not by filename — the 16 bp read is
+# the barcode. See select_reads() there.
+#
+# Two sources per run (the `source` column):
+#   ena -> ENA mirrors pre-split FASTQs; curl each URL (fast, md5-checked).
+#   sra -> prefetch + fasterq-dump --include-technical (the barcode read IS a
+#          technical read; without that flag SRA silently omits it).
+rule download_fastq:
+    output:
+        r1=maybe_temp(FASTQ / ("{srr}_R1" + FQ_EXT)),   # genomic read 1
+        r2=maybe_temp(FASTQ / ("{srr}_R2" + FQ_EXT)),   # cell barcode read (16 bp)
+        r3=maybe_temp(FASTQ / ("{srr}_R3" + FQ_EXT)),   # genomic read 2
+    params:
+        src=lambda wc: RUN.loc[wc.srr, "source"],
+        u1=lambda wc: RUN.loc[wc.srr, "r1_url"],
+        u2=lambda wc: RUN.loc[wc.srr, "r2_url"],
+        u3=lambda wc: RUN.loc[wc.srr, "r3_url"],
+        m1=lambda wc: RUN.loc[wc.srr, "r1_md5"],
+        m2=lambda wc: RUN.loc[wc.srr, "r2_md5"],
+        m3=lambda wc: RUN.loc[wc.srr, "r3_md5"],
+        sra_bin=config.get("sra_tools_bin", ""),
+        tmp=lambda wc: str(FASTQ / f"_sra_{wc.srr}"),
+        script=f"{SCRIPTS}/select_reads.py",
+        # Driven by compress_fastq, not by retention: files can be kept plain.
+        compress=("--compress" if _compress else ""),
+        plain=("0" if _compress else "1"),
+    threads: 4
+    retries: 3
+    shell:
+        r"""
+        set -euo pipefail
+        if [ "{params.src}" = "sra" ]; then
+            # --- SRA fallback: prefetch + fasterq-dump -----------------------
+            if [ -n "{params.sra_bin}" ]; then export PATH="{params.sra_bin}:$PATH"; fi
+            # --- stage on node-local disk, not the shared mount ----------------
+            # fasterq-dump writes UNCOMPRESSED FASTQ plus about as much again in
+            # sort temp: ~900 GB peak for one large ATAC run. /scratch is
+            # node-local (1.9-3.6 TB) so none of that touches shared storage.
+            # Falls back to the workdir if /scratch is absent or unwritable.
+            STAGE_ROOT="${{SCATAC_STAGE_ROOT:-/scratch}}"
+            STAGE="$STAGE_ROOT/sra_${{SLURM_JOB_ID:-$$}}"
+            if mkdir -p "$STAGE" 2>/dev/null && [ -w "$STAGE" ]; then
+                # Fast path only. scancel sends SIGKILL, which runs no trap, so
+                # this cannot be the only cleanup -- see the sweep below.
+                trap 'rm -rf "$STAGE"' EXIT INT TERM
+                echo "staging on node-local $STAGE" >&2
+
+                # Sweep staging dirs whose job is no longer running. Cancelling a
+                # job left 78 GB on a shared compute node because the trap never
+                # fired. This runs on the way IN, so a later job on the same node
+                # clears the wreckage of an earlier one; nothing has to survive
+                # being killed.
+                for d in "$STAGE_ROOT"/sra_[0-9]*; do
+                    [ -d "$d" ] || continue
+                    [ "$d" = "$STAGE" ] && continue
+                    jid="${{d##*/sra_}}"
+                    if ! squeue -h -j "$jid" >/dev/null 2>&1; then
+                        echo "sweeping stale staging dir from job $jid: $d" >&2
+                        rm -rf "$d"
+                    fi
+                done
+            else
+                STAGE="{params.tmp}"
+                echo "NOTE: /scratch unavailable; staging on shared storage" >&2
+            fi
+            rm -rf "$STAGE"; mkdir -p "$STAGE"
+            # --max-size is NOT optional. prefetch's default cap is 20G and it
+            # SILENTLY SKIPS anything larger -- printing a warning, exiting 0,
+            # and leaving no .sra behind. The failure then surfaces one step
+            # later as a misleading fasterq-dump "Cannot resolve accession
+            # (404)", which sends you hunting a bad accession instead of a size
+            # limit. Observed on GSE219015/SRR28197504 (24 GB); most real scATAC
+            # runs exceed 20 GB, so without this flag the SRA path is broken for
+            # the majority of the data it exists to fetch.
+            # --verify yes: the r*_md5 columns carry ENA checksums, and ENA is
+            # not a usable source for scATAC (it drops the barcode read), so those
+            # columns are empty on essentially every ATAC row. prefetch's own
+            # post-download verification is what actually protects this route.
+            prefetch --max-size 1000000000 --verify yes -O "$STAGE" {wildcards.srr}
+            if [ -z "$(find "$STAGE" -name '*.sra' -o -name '*.sralite' 2>/dev/null)" ]; then
+                echo "prefetch produced no .sra for {wildcards.srr}." >&2
+                echo "Most likely the run exceeds prefetch's --max-size cap (default 20G)," >&2
+                echo "or the accession is not public. Check the prefetch output above:" >&2
+                echo "a 'larger than maximum allowed: skipped' line means the size cap." >&2
+                exit 1
+            fi
+            # The retry differs from the first attempt only by being a retry.
+            # It used to drop -t and pass the accession instead of the local
+            # .sra, so a failure meant re-downloading AND writing the sort temp
+            # into the working directory on shared storage. That is how 229 GB of
+            # fasterq.tmp.* accumulated in the repo.
+            #
+            # Minimal deflines. The default is "@SRR28197504.1 1 length=50" --
+            # 63 chars, written TWICE per record (header and '+' line). At 739M
+            # reads x 3 files that is ~280 GB of pure header text, and it is why
+            # our output dwarfs ENA's for the same data. chromap uses read ORDER
+            # and the barcode file, not read names, so the names are not needed.
+            fasterq-dump --seq-defline '@$si' --qual-defline '+' \
+                --split-files --include-technical --threads {threads} \
+                -t "$STAGE" -O "$STAGE" "$STAGE/{wildcards.srr}/{wildcards.srr}.sra" \
+                || fasterq-dump --seq-defline '@$si' --qual-defline '+' \
+                     --split-files --include-technical --threads {threads} \
+                     -t "$STAGE" -O "$STAGE" "$STAGE/{wildcards.srr}/{wildcards.srr}.sra"
+            # Assign genomic/barcode roles BY READ LENGTH, same rule as ENA.
+            python {params.script} --from-dir "$STAGE" \
+                --r1 {output.r1} --r2 {output.r2} --r3 {output.r3} {params.compress}
+                    else
+            # --- ENA: direct download of pre-split FASTQs --------------------
+            # ENA/HTTP sources serve gzipped FASTQ. When the rule's outputs are
+            # PLAIN .fastq (keep_fastq: false), the stream must be decompressed
+            # on the way in -- otherwise the file is named .fastq while holding
+            # gzip bytes, and the first tool to read it fails with something
+            # unhelpful ("ID line didn't start with '@'" from FastQC). Caught by
+            # an end-to-end test; the name must never lie about the content.
+            if [ "{params.plain}" = "1" ]; then
+                curl -sSL --fail --retry 5 "{params.u1}" | gunzip -c > {output.r1}
+                curl -sSL --fail --retry 5 "{params.u2}" | gunzip -c > {output.r2}
+                curl -sSL --fail --retry 5 "{params.u3}" | gunzip -c > {output.r3}
+            else
+                curl -sSL --fail --retry 5 -o {output.r1} "{params.u1}"
+                curl -sSL --fail --retry 5 -o {output.r2} "{params.u2}"
+                curl -sSL --fail --retry 5 -o {output.r3} "{params.u3}"
+            fi
+            # md5s from ENA describe the GZIPPED bytes, so they only apply when
+            # we stored those bytes verbatim. Decompressing on the fly changes
+            # the file, and checking then would fail every time.
+            if [ "{params.plain}" != "1" ]; then
+                if [ -n "{params.m1}" ]; then echo "{params.m1}  {output.r1}" | md5sum -c -; fi
+                if [ -n "{params.m2}" ]; then echo "{params.m2}  {output.r2}" | md5sum -c -; fi
+                if [ -n "{params.m3}" ]; then echo "{params.m3}  {output.r3}" | md5sum -c -; fi
+            fi
+        fi
+        """
+
+# ------------------------------ read QC --------------------------------------
+rule fastqc:
+    input:
+        r1=FASTQ / ("{srr}_R1" + FQ_EXT),
+        r2=FASTQ / ("{srr}_R2" + FQ_EXT),
+        r3=FASTQ / ("{srr}_R3" + FQ_EXT),
+    output:
+        z1=QC / "fastqc" / "{srr}_R1_fastqc.zip",
+        z2=QC / "fastqc" / "{srr}_R2_fastqc.zip",
+        z3=QC / "fastqc" / "{srr}_R3_fastqc.zip",
+    threads: 2
+    params:
+        outdir=lambda wc: str(QC / "fastqc"),
+    shell:
+        "mkdir -p {params.outdir} && "
+        "fastqc -t {threads} -o {params.outdir} {input.r1} {input.r2} {input.r3}"
+
+# --------------------- barcode orientation (empirical) -----------------------
+# Whether a 10x barcode whitelist must be reverse-complemented depends on the
+# SEQUENCER's index-read chemistry, not on the assay — so it cannot be hardcoded
+# per protocol. Rather than ask the user to guess (plan.md's original position),
+# we do what ENCODE_scatac does: sample reads, count exact whitelist matches in
+# BOTH orientations, and pick the winner. If NEITHER orientation clears
+# min_match_rate the sample aborts here, loudly, instead of producing an
+# almost-empty fragment file 6 CPU-hours later.
+rule detect_barcode_orientation:
+    input:
+        bc=lambda wc: expand(str(FASTQ / ("{srr}_R2" + FQ_EXT)),
+                             srr=SAMPLE_RUNS[wc.sample][:1]),
+        whitelist=lambda wc: whitelist_for(wc.sample),
+        # The OTHER modality's whitelist, so the reads can contradict the sheet.
+        whitelist_alt=lambda wc: (BC["whitelist_10x"]
+                                  if modality_for(wc.sample) == "multiome"
+                                  else BC.get("whitelist_multiome_atac", "")),
+        # Built for unknown too: if the reads turn out to be multiome the table
+        # must already exist, and building it for a sample that turns out to be
+        # 10x costs one cheap local job whose output goes unused.
+        table=lambda wc: ([str(WORK / "arc_translation.tsv")]
+                          if modality_for(wc.sample) in ("multiome", "unknown")
+                          else []),
+    output:
+        whitelist=QC / "barcodes" / "{sample}.whitelist.txt",
+        report=QC / "barcodes" / "{sample}.orientation.txt",
+        # Always produced: the ARC table re-oriented to match the whitelist for
+        # multiome, an EMPTY file for plain 10x. Unconditional so the DAG has no
+        # per-wildcard optional output.
+        translation=QC / "barcodes" / "{sample}.translation.tsv",
+    params:
+        # Multiome only. The translation table must end up in the SAME barcode
+        # orientation as the whitelist, or chromap aborts mid-alignment with
+        # "Barcode does not exist in the translation table."
+        translate_in=lambda wc: (f"--translation-in {WORK}/arc_translation.tsv"
+                                 if modality_for(wc.sample) == "multiome" else ""),
+        forced=BC.get("orientation", "auto"),
+        modality=lambda wc: modality_for(wc.sample),
+        min_rate=BC.get("min_match_rate", 0.25),
+        n_reads=BC.get("n_sample_reads", 100000),
+        script=f"{SCRIPTS}/detect_barcode_orientation.py",
+    shell:
+        r"""
+        python {params.script} \
+            --fastq {input.bc} \
+            --whitelist {input.whitelist} \
+            --modality {params.modality} \
+            --whitelist-alt "{input.whitelist_alt}" \
+            --orientation {params.forced} \
+            --min-match-rate {params.min_rate} \
+            --n-reads {params.n_reads} \
+            --out-whitelist {output.whitelist} \
+            --report {output.report} \
+            --translation-out {output.translation} {params.translate_in}
+        """
+
+# ------------------------------ alignment ------------------------------------
+def sample_fq(read):
+    def _inner(wc):
+        return expand(str(FASTQ / ("{srr}_" + read + FQ_EXT)),
+                      srr=SAMPLE_RUNS[wc.sample])
+    return _inner
+
+rule chromap:
+    input:
+        r1=sample_fq("R1"),
+        r2=sample_fq("R2"),
+        r3=sample_fq("R3"),
+        index=CHROMAP_INDEX,
+        fasta=config["reference"]["fasta"],
+        whitelist=QC / "barcodes" / "{sample}.whitelist.txt",
+        # The ORIENTED, per-sample table -- not the global one. Always an input
+        # (empty for 10x); only the --barcode-translate FLAG is conditional.
+        translation=QC / "barcodes" / "{sample}.translation.tsv",
+        # Carries barcode_offset, which chromap needs to locate the barcode
+        # inside a longer barcode read. See --read-format in the shell block.
+        orientation=QC / "barcodes" / "{sample}.orientation.txt",
+    output:
+        frag=FRAG / "{sample}.fragments.tsv.gz",
+        tbi=FRAG / "{sample}.fragments.tsv.gz.tbi",
+        summary=QC / "chromap" / "{sample}.chromap_summary.csv",
+    threads: config["threads"]
+    resources:
+        mem_mb=64000,
+    params:
+        # chromap accepts comma-separated FASTQ lists, so a multi-run sample is
+        # aligned in one pass (no per-run fragment files to merge).
+        r1=lambda wc, input: ",".join(input.r1),
+        r2=lambda wc, input: ",".join(input.r2),
+        r3=lambda wc, input: ",".join(input.r3),
+        raw=lambda wc: str(FRAG / f"{wc.sample}.fragments.raw.bed"),
+        # NOT decided here. The flag is added in the shell if the oriented
+        # translation table is non-empty, and detect_barcode_orientation writes
+        # that table from the MEASURED modality: empty for 10x, 736,320 pairs for
+        # multiome. Keying off the sheet instead would let a mislabelled sample
+        # skip barcode translation and produce a well-formed, wrongly-keyed
+        # object.
+        script=f"{SCRIPTS}/compress_fragments.py",
+    # -1/-2 are the GENOMIC mates and -b is the BARCODE read. Our r2 is the
+    # barcode, so the genomic pair is (r1, r3) — this ordering is the single
+    # most important line in the file to get right.
+    # NOTE: comments must stay ABOVE `shell:` — Snakemake's parser requires the
+    # command string to immediately follow the `shell:` keyword.
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.frag}) $(dirname {output.summary})
+
+        # --- locate the barcode INSIDE the barcode read -----------------------
+        # 10x Multiome ATAC reads contain an 8 bp spacer followed by a 16 bp barcode (24 bp total).
+        # The whitelist contains only the 16 bp barcodes. Giving raw 24 bp reads to chromap causes an error.
+        #
+        # To fix this, we use `--read-format` to slice the exact barcode region.
+        # This avoids rewriting massive FASTQ files into trimmed duplicates.
+        #
+        # We calculate the offset and length dynamically at runtime so this script 
+        # works for other chemistries without hardcoded bugs. 
+
+        # Derive barcode geometry from the detector output and whitelist
+
+        BC_OFF=$(awk '$1=="barcode_offset"{{print $2}}' {input.orientation})
+        BC_LEN=$(head -1 {input.whitelist} | tr -d '\r\n' | wc -c)
+        if [ -z "$BC_OFF" ] || [ "$BC_LEN" -lt 1 ]; then
+            echo "cannot determine barcode geometry: offset='$BC_OFF' len='$BC_LEN'" >&2
+            exit 1
+        fi
+        BC_END=$(( BC_OFF + BC_LEN - 1 ))
+
+        # Validate the read is long enough before loading the index.
+
+        READ_LEN=$(head -2 $(echo {params.r2} | cut -d, -f1) | tail -1 | tr -d '\r\n' | wc -c)
+        if [ "$READ_LEN" -lt $(( BC_END + 1 )) ]; then
+            echo "barcode read is $READ_LEN bp but offset $BC_OFF + length $BC_LEN needs $(( BC_END + 1 ))" >&2
+            exit 1
+        fi
+        echo "[chromap] barcode slice bc:$BC_OFF:$BC_END of a $READ_LEN bp read (whitelist $BC_LEN bp)" >&2
+
+        # Barcode translation comes from what the reads measured, not the sheet.
+        XLAT=""
+        if [ -s {input.translation} ]; then
+            XLAT="--barcode-translate {input.translation}"
+            echo "[chromap] multiome: translating barcodes via {input.translation}" >&2
+        else
+            echo "[chromap] plain 10x: no barcode translation" >&2
+        fi
+
+        chromap -t {threads} --preset atac \
+            -x {input.index} \
+            -r {input.fasta} \
+            -1 {params.r1} \
+            -2 {params.r3} \
+            -b {params.r2} \
+            --read-format bc:$BC_OFF:$BC_END,r1:0:-1,r2:0:-1 \
+            --barcode-whitelist {input.whitelist} \
+            $XLAT \
+            --summary {output.summary} \
+            -o {params.raw}
+        # bgzip + tabix via pysam (no bgzip/tabix CLI dependency). scATACpipe
+        # emits plain gzip here and explicitly punts on bgzip; that leaves the
+        # fragment file unindexable, which snapATAC2 and IGV both need.
+        python {params.script} --raw {params.raw} --out {output.frag}
+        rm -f {params.raw}
+        """
+
+# ------------------------------ peaks ----------------------------------------
+# PROVISIONAL aggregate peak set: it exists to give the QC gate a FRiP number and
+# to build a first-pass matrix. Peak calling is population-dependent, so
+# per-cluster pseudobulk recalling is downstream (skill-layer) work.
+#
+# chromap has ALREADY applied the +4/-5 Tn5 coordinate shift to these fragments.
+# --shift/--extsize below is the separate MACS3 pileup smoothing operation, NOT a
+# second Tn5 shift. Do not "fix" this by removing them.
+rule macs3_peaks:
+    input:
+        frag=FRAG / "{sample}.fragments.tsv.gz",
+    output:
+        peaks=PEAKS / "{sample}_peaks.narrowPeak",
+    params:
+        outdir=lambda wc: str(PEAKS),
+        gsize=config["reference"]["gsize"],
+        q=PK.get("qvalue", 0.05),
+        shift=PK.get("shift", -100),
+        extsize=PK.get("extsize", 200),
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        macs3 callpeak -t {input.frag} -f BED -g {params.gsize} \
+            --nomodel --shift {params.shift} --extsize {params.extsize} \
+            -q {params.q} --keep-dup all \
+            -n {wildcards.sample} --outdir {params.outdir}
+        """
+
+# --------------------------- peak filtering ----------------------------------
+# Separate from macs3_peaks so the raw call stays on disk and the drop can be
+# audited: an unexpectedly large drop means the peak call is wrong, not the
+# filter. Also lets Snakemake re-run just this step when the blacklist changes.
+#
+# MEASURED, twice, on real PBMC data:
+#   atac_pbmc_500_nextgem (10% downsample): 35,037 -> 34,772 peaks. Dropped
+#     peaks were 1.02x the mean strength of kept peaks.
+#   atac_v1_pbmc_5k (full depth):           89,268 -> 88,426 peaks. Dropped
+#     peaks were 0.96x the mean strength of kept peaks.
+#
+# So blacklisted peaks are NOT disproportionately strong, and this does NOT
+# meaningfully change FRiP -- not at shallow depth, and not at 10x the depth
+# either. The hypothesis that blacklist artifacts are a depth-dependent
+# phenomenon was tested and is not supported by these data.
+#
+# The filter is kept for a different and better reason: a peak inside a
+# collapsed repeat or a low-mappability region is not a regulatory element
+# regardless of its height, and should not reach a differential-accessibility
+# result. That is an interpretability argument, not a QC-metric one.
+rule filter_peaks:
+    input:
+        peaks=PEAKS / "{sample}_peaks.narrowPeak",
+    output:
+        peaks=PEAKS / "{sample}_peaks.filtered.narrowPeak",
+        report=QC / "peaks" / "{sample}.peak_filter.tsv",
+    params:
+        blacklist=PK.get("blacklist", ""),
+        primary=("--primary-chroms-only" if PK.get("primary_chroms_only", True) else ""),
+        script=f"{SCRIPTS}/filter_peaks.py",
+    shell:
+        r"""
+        python {params.script} \
+            --peaks {input.peaks} \
+            --out {output.peaks} \
+            --blacklist "{params.blacklist}" \
+            --report {output.report} \
+            {params.primary}
+        """
+
+# --------------------------- fragments -> h5ad -------------------------------
+# One rule, not two. The plan sketched build_matrix and fragments_to_h5ad as
+# separate steps, but both need exactly the same inputs (fragments + peaks + GTF)
+# and both write an AnnData — splitting them would write the matrix to disk twice
+# for no gain. snapATAC2 builds the peak x cell matrix and computes TSS
+# enrichment / nucleosome signal; pyranges computes FRiP; cell calling is the
+# transparent two-threshold rule from config.
+rule fragments_to_h5ad:
+    input:
+        frag=FRAG / "{sample}.fragments.tsv.gz",
+        tbi=FRAG / "{sample}.fragments.tsv.gz.tbi",
+        peaks=PEAKS / "{sample}_peaks.filtered.narrowPeak",
+        summary=QC / "chromap" / "{sample}.chromap_summary.csv",
+        orientation=QC / "barcodes" / "{sample}.orientation.txt",
+        versions=WORK / ".versions_ok",
+    output:
+        h5ad=H5AD / "{sample}.h5ad",
+    params:
+        gtf=config["reference"]["gtf"],
+        fasta=config["reference"]["fasta"],
+        min_frags=QCC["cell_min_unique_frags"],
+        min_frip=QCC["cell_min_frip"],
+        script=f"{SCRIPTS}/fragments_to_h5ad.py",
+    shell:
+        r"""
+        python {params.script} \
+            --fragments {input.frag} \
+            --peaks {input.peaks} \
+            --chromap-summary {input.summary} \
+            --orientation-report {input.orientation} \
+            --gtf "{params.gtf}" \
+            --fasta "{params.fasta}" \
+            --sample {wildcards.sample} \
+            --cell-min-unique-frags {params.min_frags} \
+            --cell-min-frip {params.min_frip} \
+            -o {output.h5ad}
+        """
+
+# Structural check on the object itself: shape, var coordinates, obs QC columns
+# present and non-NaN, uns['fragments'] pointing at a file that exists. Names the
+# CAUSE of a failure, not just the symptom.
+rule check_h5ad:
+    input:
+        h5ad=H5AD / "{sample}.h5ad",
+    output:
+        ok=QC / "h5ad_check" / "{sample}.ok",
+    params:
+        script=f"{SCRIPTS}/check_h5ad.py",
+    shell:
+        "python {params.script} {input.h5ad} --out {output.ok}"
+
+# ---------------------- deterministic QC gate --------------------------------
+rule qc_report:
+    input:
+        h5ads=expand(str(H5AD / "{sample}.h5ad"), sample=SAMPLES),
+        checks=expand(str(QC / "h5ad_check" / "{sample}.ok"), sample=SAMPLES),
+        summaries=expand(str(QC / "chromap" / "{sample}.chromap_summary.csv"),
+                         sample=SAMPLES),
+    output:
+        report=QC / "qc_gate.tsv",
+        passlist=QC / "qc_pass.txt",
+    params:
+        entries=lambda wc: [f"{s}={H5AD}/{s}.h5ad" for s in SAMPLES],
+        frip=QCC["min_frac_reads_in_peaks"],
+        tss=QCC["min_tss_enrichment"],
+        cells=QCC["min_estimated_cells"],
+        vb=QCC["min_valid_barcode_frac"],
+        dup=QCC["max_duplicate_rate"],
+        # Optional so older configs still parse. Omitting it skips the check,
+        # which is the pre-existing behaviour rather than a silent pass.
+        maprate_flag=(f"--min-mapping-rate {QCC['min_mapping_rate']}"
+                      if QCC.get("min_mapping_rate") is not None else ""),
+        script=f"{SCRIPTS}/qc_gate.py",
+    shell:
+        "python {params.script} {params.entries} "
+        "--report {output.report} --passlist {output.passlist} "
+        "--min-frac-reads-in-peaks {params.frip} "
+        "--min-tss-enrichment {params.tss} "
+        "--min-estimated-cells {params.cells} "
+        "--min-valid-barcode-frac {params.vb} "
+        "--max-duplicate-rate {params.dup} "
+        "{params.maprate_flag}"
+
+# Enforcement is separate from reporting so the report survives a failed gate.
+rule qc_check:
+    input:
+        passlist=QC / "qc_pass.txt",
+        report=QC / "qc_gate.tsv",
+    output:
+        QC / "qc_ok.txt",
+    params:
+        n=len(SAMPLES),
+        strict=(QCC["mode"] == "strict"),
+    shell:
+        r"""
+        n_pass=$(grep -c . {input.passlist} || true)
+        if [ "{params.strict}" = "True" ] && [ "$n_pass" -ne "{params.n}" ]; then
+          echo "QC gate: only $n_pass/{params.n} samples passed (mode=strict)." >&2
+          echo "See {input.report}. Fix or remove failing samples, then rerun." >&2
+          exit 1
+        fi
+        cp {input.passlist} {output}
+        """
+
+# ------------------------------ merge ----------------------------------------
+rule merge:
+    input:
+        h5ads=expand(str(H5AD / "{sample}.h5ad"), sample=SAMPLES),
+        gate=QC / "qc_ok.txt",
+    output:
+        WORK / "combined.h5ad",
+    params:
+        script=f"{SCRIPTS}/merge_h5ad.py",
+    shell:
+        "python {params.script} -o {output} --h5ad {input.h5ads}"
+
+# ------------------------------ MultiQC report -------------------------------
+rule multiqc:
+    input:
+        fastqc=expand(str(QC / "fastqc" / "{srr}_R{read}_fastqc.zip"),
+                      srr=ALL_SRR, read=[1, 2, 3]),
+        peaks=expand(str(PEAKS / "{sample}_peaks.narrowPeak"), sample=SAMPLES),
+    output:
+        QC / "multiqc_report.html",
+    params:
+        outdir=lambda wc: str(QC),
+        scan=lambda wc: f"{QC}/fastqc {QC}/chromap {PEAKS}",
+    shell:
+        "multiqc -f -o {params.outdir} -n multiqc_report.html {params.scan}"
+
+# ------------------------- read-QC flag (reporting) --------------------------
+# Parses every run's FastQC output and flags read quality against fixed config
+# thresholds. Role-aware: R2 = 16 bp barcode read (lenient), R1/R3 = genomic
+# reads (strict). NON-FATAL by design — a report layer, never a gate.
+rule read_qc:
+    input:
+        fastqc=expand(str(QC / "fastqc" / "{srr}_R{read}_fastqc.zip"),
+                      srr=ALL_SRR, read=[1, 2, 3]),
+    output:
+        report=QC / "read_qc.tsv",
+        passlist=QC / "read_qc_pass.txt",
+    params:
+        fastqc_dir=lambda wc: str(QC / "fastqc"),
+        samples=config["samples_tsv"],
+        min_reads=RQC.get("min_reads", 1000),
+        min_mean_quality=RQC.get("min_mean_quality", 28),
+        max_adapter_fraction=RQC.get("max_adapter_fraction", 0.10),
+        min_barcode_len=RQC.get("min_barcode_len", 16),
+        script=f"{SCRIPTS}/read_qc.py",
+    shell:
+        "python {params.script} "
+        "--fastqc-dir {params.fastqc_dir} "
+        "--samples {params.samples} "
+        "--report {output.report} --passlist {output.passlist} "
+        "--min-reads {params.min_reads} "
+        "--min-mean-quality {params.min_mean_quality} "
+        "--max-adapter-fraction {params.max_adapter_fraction} "
+        "--min-barcode-len {params.min_barcode_len}"

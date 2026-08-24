@@ -1,0 +1,19 @@
+# Datasets manifest — one row per study to fetch + process.
+# The reconciler (reconcile.py --manifest) and driver (run_batch.sh) read this.
+# Copy to config/manifest.tsv and edit for your studies.
+#
+# Tab-separated. Columns:
+#   accession    label used in reports and the retry ledger (e.g. GSE219015)
+#   workdir      the study's pipeline workdir (matches its config's workdir:)
+#   samples_tsv  the sheet prepare_runs.py wrote for it
+#   configfile   the config passed to run_slurm.sh --configfile
+#
+# ONE GENOME PER STUDY: the pipeline refuses a sheet mixing genomes, so split
+# a multi-species study into separate rows with separate sheets.
+#
+# A study spanning species becomes two rows, because prepare_runs.py writes one
+# sheet per genome and each needs its own workdir and config.
+#
+# accession	workdir	samples_tsv	configfile
+GSE219015	/path/to/data/scatac/GSE219015_human	config/samples.GSE219015.GRCh38.tsv	config/config.GSE219015.human.yaml
+GSE219015	/path/to/data/scatac/GSE219015_mouse	config/samples.GSE219015.mm10.tsv	config/config.GSE219015.mouse.yaml

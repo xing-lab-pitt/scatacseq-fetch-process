@@ -1,0 +1,36 @@
+# Site configuration -- absolute paths for ONE machine.
+#
+# This .example file IS committed; your copy is not:
+#     cp activate.local.sh.example activate.local.sh   # then edit
+# .gitignore keeps activate.local.sh out of git, so the repo stays portable.
+#
+# Sourced by run_slurm.sh. Every assignment uses := ("assign only if unset"),
+# so an explicit environment variable still wins:
+#     SCATAC_VENV=/other/venv sbatch run_slurm.sh --configfile config/my.yaml
+#
+# There is no default that could work everywhere, so the pipeline asks rather
+# than guesses: a wrong-but-plausible default would fail deep inside a rule
+# hours later, instead of in the first two seconds where it belongs.
+
+# Python venv providing snakemake, its SLURM executor, snapATAC2, macs3, pysam.
+: "${SCATAC_VENV:=/path/to/your/.venv}"
+
+# Colon-separated dirs holding the non-Python binaries: chromap, FastQC,
+# sra-tools. Omit any that are already on the system PATH.
+: "${SCATAC_EXTRA_PATH:=/path/to/chromap:/path/to/FastQC:/path/to/sratoolkit/bin}"
+
+# Optional: a different Snakemake profile (default: profiles/slurm).
+# : "${SCATAC_PROFILE:=profiles/slurm}"
+
+# Optional: node-local staging root for fasterq-dump. Must be writable on every
+# compute node. Defaults to /scratch; the pipeline falls back to the workdir if
+# it is absent or unwritable.
+# : "${SCATAC_STAGE_ROOT:=/scratch}"
+
+
+# Directory holding the 10x barcode whitelists (737K-cratac-v1.txt,
+# 737K-arc-v1*.txt). Used by tests/integration, which skips when it is unset,
+# and handy to have exported when running scripts by hand.
+: "${SCATAC_WHITELIST_DIR:=/path/to/10x_whitelists}"
+
+export SCATAC_VENV SCATAC_EXTRA_PATH SCATAC_WHITELIST_DIR

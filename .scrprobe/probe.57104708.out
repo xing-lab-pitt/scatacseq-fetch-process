@@ -1,0 +1,15 @@
+node: n037
+  /scr             exists     3.3T free of   3.5T  WRITABLE
+  /scr/scratch     absent
+  /scratch         exists     3.3T free of   3.5T  WRITABLE
+  /local           absent
+  /localscratch    absent
+  /tmp             exists      69G free of    92G  WRITABLE
+--- contents of /scr ---
+2024_hardware-info.txt
+dask-scratch-space
+edr66
+ewald_run13_56944570
+ewald_run15_56944188
+ewald_run8_56944528
+star_index_shared.lock

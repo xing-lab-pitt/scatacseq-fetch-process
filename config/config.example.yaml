@@ -1,0 +1,200 @@
+# ---------------------------------------------------------------------------
+# scATAC-seq chromap pipeline config  (TEMPLATE)
+#
+#   cp config/config.example.yaml config/config.yaml   # then edit the paths
+#
+# Defaults reproduce 10x Chromium single-cell ATAC v1/v2. Replace every
+# <PLACEHOLDER> with a path on YOUR system. config/config.yaml is gitignored so
+# your local paths are never committed.
+#
+# The values shown in comments marked "capricorn:" are the working values on the
+# pipeline author's cluster — copy them if you are on that machine.
+# ---------------------------------------------------------------------------
+
+# Sample sheet from workflow/scripts/prepare_runs.py (or hand-written).
+# Columns: sample  srr  source  modality  genome
+#          r1_url  r2_url  r3_url  r1_md5  r2_md5  r3_md5
+#   r1 = genomic read 1, r2 = CELL BARCODE read (16 bp), r3 = genomic read 2.
+#   source   : ena | sra   (per-run; ENA first, SRA fallback)
+#   modality : 10x         (multiome is NOT supported in this pass — see README)
+#   genome   : GRCh38      (mm10 is a config change, not a code change)
+samples_tsv: "config/samples.tsv"
+
+# Where FASTQs, fragments, matrices and reports are written. One dir per study.
+# example: "/data/scatac/<accession>"
+workdir: "<PLACEHOLDER>/scatac/<accession>"
+
+threads: 8
+
+# Preflight: enforced against the active environment by check_versions.py.
+requirements_txt: "requirements-pipeline.txt"
+
+# sra-tools bin dir, used ONLY for runs whose `source` is "sra" (not mirrored on
+# ENA). Provides prefetch + fasterq-dump. Leave "" if all runs come from ENA, or
+# if prefetch/fasterq-dump are already on PATH.
+# example: "/opt/sratoolkit/bin"
+sra_tools_bin: ""
+
+# --- disk guard -------------------------------------------------------------
+# ATAC FASTQs are large (~30-80 GB per 10x sample). check_versions.py aborts the
+# run before any download if the workdir's filesystem has less than this free.
+# Set it to roughly (number of samples x 100 GB) for a comfortable margin.
+# Preflight aborts below this. BUDGET FOR THE UNCOMPRESSED STAGE, not the
+# download: fasterq-dump writes plain FASTQ and the pipeline then gzips it, so
+# peak usage is both at once. Measured on a 739M-spot run: 332 GB uncompressed,
+# ~430-530 GB peak. 500 covers one such sample; the SLURM profile caps
+# concurrent downloads at 1 so this is a per-sample figure, not a per-study one.
+min_free_gb: 500
+
+# Delete each run's raw FASTQ as soon as chromap has consumed it (Snakemake
+# temp()). The fragment file is the durable artifact, not the reads. Set true
+# only if you have the disk and want to re-align without re-downloading.
+keep_fastq: false
+# Gzip the raw FASTQs. Independent of keep_fastq: a run being verified can
+# keep them uncompressed, which skips hours of gzip on a large study.
+# Defaults to keep_fastq when unset.
+compress_fastq: false
+
+# --- references, keyed by genome ------------------------------------------
+# ONE GENOME PER RUN. The `genome` column in samples.tsv selects which block
+# below is used; a sheet mixing genomes is refused at parse time, because the
+# merged object is a union of peak sets and a cross-species union is meaningless.
+#
+# All paths are validated at PARSE TIME, before anything downloads -- an SRA
+# download for a single ATAC run can take hours, so a bad path should cost a
+# second, not a night.
+#
+# capricorn values are shown; replace <PLACEHOLDER> elsewhere.
+references:
+  GRCh38:
+    # example: /refs/GRCh38/fasta/genome.fa
+    fasta: "<PLACEHOLDER>/refdata-gex-GRCh38-2024-A/fasta/genome.fa"
+    gtf:   "<PLACEHOLDER>/refdata-gex-GRCh38-2024-A/genes/genes.gtf"
+    # Prebuilt-index hint, or a writable path to build+keep it at.
+    chromap_index: "<PLACEHOLDER>/refdata-gex-GRCh38-2024-A/GRCh38.chromap"
+    gsize: hs                     # MACS3 effective genome size
+    blacklist: "<PLACEHOLDER>/blacklists/hg38-blacklist.v2.bed"
+  mm10:
+    # fasta + gtf: UCSC goldenPath (per scATACpipe assets/genome_ucsc.json)
+    #   https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz
+    #   https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/genes/mm10.ncbiRefSeq.gtf.gz
+    fasta: "<PLACEHOLDER>/mm10/mm10.fa"
+    gtf:   "<PLACEHOLDER>/mm10/mm10.ncbiRefSeq.gtf"
+    chromap_index: "<PLACEHOLDER>/mm10/mm10.chromap"
+    gsize: mm                     # ENCODE_scatac uses 1.87e9; "mm" is MACS3's alias
+    # ENCODE mm10 blacklist v2 = ENCFF547MET (per ENCODE_scatac config)
+    blacklist: "<PLACEHOLDER>/blacklists/mm10-blacklist.v2.bed"
+
+# --- barcodes ---------------------------------------------------------------
+barcodes:
+  # Plain 10x scATAC. NOT shipped with this repo; see README "Install" — it is
+  # copied from repos/scATACpipe/assets/whitelist_barcodes/737K-cratac-v1.txt.gz
+  # example: "/refs/10x_whitelists/737K-cratac-v1.txt"
+  whitelist_10x: "<PLACEHOLDER>/737K-cratac-v1.txt"
+  # 10x Multiome ARC *ATAC* whitelist. Unused in this pass (multiome is refused).
+  #
+  # WARNING: Cell Ranger ARC ships TWO DIFFERENT FILES both named
+  # 737K-arc-v1.txt -- lib/python/atac/barcodes/ (ATAC) and
+  # lib/python/cellranger/barcodes/ (GEX). They are different barcode universes.
+  # This key needs the ATAC one. The copy in most reference dirs (including this
+  # cluster's) is the GEX one, because that is what the scRNA pipeline uses.
+  # Pointing this at the GEX list would produce a silently wrong run.
+  # See M5_MULTIOME_PLAN.md.
+  # example: "/refs/10x_whitelists/737K-arc-v1.txt"
+  # --- Multiome (ARC) only. Both files are named 737K-arc-v1.txt in a Cell
+  # Ranger ARC install; they are DIFFERENT barcode universes (verified: 736,320
+  # entries each, 0 shared, not a revcomp relationship). Getting them the wrong
+  # way round produces a well-formed object keyed to the wrong cells.
+  #   ATAC -> lib/python/atac/barcodes/737K-arc-v1.txt
+  #   GEX  -> lib/python/cellranger/barcodes/737K-arc-v1.txt
+  # The ATAC one is also mirrored by ENCODE:
+  #   http://mitra.stanford.edu/kundaje/atwang/encode_scatac/whitelists/737K-arc-v1.txt.gz
+  whitelist_multiome_atac: "<PLACEHOLDER>/737K-arc-v1.ATAC.txt"
+  whitelist_multiome_gex:  "<PLACEHOLDER>/737K-arc-v1.txt"
+  # auto     = detect forward vs reverse-complement empirically per sample by
+  #            matching sampled reads against both orientations (recommended;
+  #            the orientation depends on the SEQUENCER, not the assay).
+  # forward  = force the whitelist as written.
+  # revcomp  = force the reverse complement.
+  orientation: auto
+  # Fraction of sampled reads that must match the whitelist in the better
+  # orientation. Below this, the sample aborts rather than producing an
+  # almost-empty fragment file.
+  min_match_rate: 0.25
+  n_sample_reads: 100000
+
+# --- deterministic QC gate --------------------------------------------------
+# Thresholds live HERE (version-controlled), not chosen at runtime, so pass/fail
+# is reproducible. Sources: chromap --summary (barcode/duplicate), snapATAC2
+# (TSS, nucleosome), pyranges overlap (FRiP).
+qc:
+  mode: strict                  # strict = stop the run if any sample fails; warn = report only
+  min_frac_reads_in_peaks: 0.15 # bulk FRiP
+  min_tss_enrichment: 4.0       # snapATAC2
+  min_estimated_cells: 100
+  min_valid_barcode_frac: 0.70  # chromap --summary
+  # NOTE: duplicate rate rises with sequencing depth -- a fixed library
+  # re-sampled deeper yields more duplicates. Measured: 0.19 on a 10% downsample
+  # vs 0.48 on the same tissue at full depth. 0.80 is comfortable for both, but
+  # this ceiling is the one threshold that is depth-sensitive by nature; revisit
+  # it if you sequence substantially deeper than ~100M fragments per sample.
+  max_duplicate_rate: 0.80
+  # Transparent per-cell calling (scATAC-pro style): a barcode is a cell if it
+  # clears BOTH of these. Deliberately simple and inspectable.
+  cell_min_unique_frags: 1000
+  cell_min_frip: 0.20
+
+# --- raw-read QC (reporting only) -------------------------------------------
+# Flags each run's FastQC output. Role-aware: r2 is the 16 bp barcode read
+# (judged leniently), r1/r3 are the genomic reads (judged strictly). Always
+# NON-FATAL — a report layer, never a gate.
+read_qc:
+  mode: warn
+  min_reads: 1000
+  min_mean_quality: 28          # min mean per-base Phred on the genomic reads
+  max_adapter_fraction: 0.10
+  min_barcode_len: 16           # the 10x scATAC cell barcode is exactly 16 bp
+
+# --- peak calling -----------------------------------------------------------
+# The aggregate peak set is PROVISIONAL: it exists to give QC a FRiP number and
+# to build a first-pass matrix. Peak calling is population-dependent, so
+# per-cluster pseudobulk recalling belongs downstream (scATACpipe's point).
+peaks:
+  # ENCODE blacklist (Amemiya et al., Sci Rep 2019): regions that produce high
+  # signal in ANY ChIP/ATAC experiment regardless of biology -- collapsed
+  # repeats, centromeric satellite, low-mappability. Peaks there are artifacts.
+  # hg38 v2 = 636 regions / 227 Mb. Ships with scATACpipe
+  # (assets/hg38-blacklist.v2.bed.gz). Set "" to disable.
+  # MUST use the same contig naming as your reference -- filter_peaks.py refuses
+  # on a mismatch rather than silently filtering nothing.
+  # example: "/refs/blacklists/hg38-blacklist.v2.bed"
+  blacklist: "<PLACEHOLDER>/hg38-blacklist.v2.bed"
+  # Keep only chr1-22, chrX, chrY. Drops unplaced scaffolds and chrM -- neither
+  # is interpretable as a regulatory element.
+  primary_chroms_only: true
+  # DECISION: use these values, do not tune them.
+  #
+  # They are the community ATAC defaults (MAESTRO, scATACpipe, ENCODE-style
+  # pipelines all use them), not arbitrary picks:
+  #   qvalue 0.05          = MACS3's own default, unchanged
+  #   --nomodel            = REQUIRED for ATAC. MACS3 otherwise tries to learn a
+  #                          shift model that assumes ChIP-seq structure (paired
+  #                          strand pileups flanking a bound protein). Tn5 does
+  #                          not bind a fixed site, so that model fits a pattern
+  #                          which is not there.
+  #   shift -100 + extsize 200 = a 200 bp window CENTRED on each insertion.
+  #                          NOT a Tn5 re-shift -- chromap already applied +4/-5.
+  #
+  # Why tuning is a trap: the obvious knob is loosening qvalue to raise FRiP,
+  # but FRiP is circular (peaks are called from the same reads it measures), so
+  # that improves the number while degrading the peak set. TSS enrichment is the
+  # independent check, and it does not respond to peak-caller settings at all.
+  #
+  # Also: this peak set is PROVISIONAL by design -- real peak calling is
+  # per-cluster pseudobulk downstream. Tuning it optimises a placeholder.
+  #
+  # Measured on two real datasets with these values: FRiP 0.60 and 0.73, with
+  # TSSe 22.7 and 23.4 agreeing independently. Nothing indicates a problem.
+  qvalue: 0.05
+  shift: -100
+  extsize: 200

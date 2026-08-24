@@ -1,0 +1,44 @@
+# Pipeline outputs and Snakemake state (large / machine-specific — never commit)
+results/
+.snakemake/
+scatac_ctl.*.log
+*.log
+
+# Your local, path-filled config and real sample sheets (templates are committed
+# as *.example.*). Keep your machine's absolute paths out of git.
+config/config.yaml
+config/config.*.yaml
+!config/config.example.yaml
+config/samples.tsv
+config/samples.*.tsv
+!config/samples.example.tsv
+
+# Reference data (too large / licensed — obtain per README, keep out of git)
+reference/
+*.fa
+*.fasta
+*.gtf
+*.sra
+*.fastq
+*.fastq.gz
+
+# Python
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Site activation (machine-specific paths). The .example template IS committed.
+activate.local.sh
+!activate.local.sh.example
+
+# Batch-run state and editor backups (machine-specific, regenerated)
+.batch_state/
+*.bak
+*.orig

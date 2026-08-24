@@ -1,0 +1,20 @@
+# Binary tools for the upstream stages. These are NOT Python/pip packages, so
+# they come from bioconda rather than requirements-pipeline.txt.
+#
+# NOT USED ON THE AUTHOR'S CLUSTER, which has no module system: there, tools come
+# from an activated venv plus $SCATAC_EXTRA_PATH (see run_slurm.sh) and the SLURM
+# profile sets use-conda: false. This file exists so the pipeline is portable to
+# a site that prefers Snakemake-managed environments -- set use-conda: true.
+#
+# IMPORTANT: build the chromap index and run alignment with the SAME chromap
+# version. rule resolve_chromap_index enforces this via a .build_info sidecar.
+name: scatacseq-tools
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - chromap=0.2.7
+  - fastqc=0.12.1
+  - multiqc=1.35
+  - sra-tools=3.0.2
+  - curl

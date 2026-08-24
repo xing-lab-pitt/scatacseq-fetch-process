@@ -1,0 +1,133 @@
+# =============================================================================
+# Snakemake SLURM profile for the scATAC-seq chromap pipeline
+#
+#   snakemake --profile profiles/slurm
+#
+# Each rule is submitted as its own right-sized SLURM job via the
+# snakemake-executor-plugin-slurm.
+#
+# Unlike the scRNA sibling, NOTHING here needs the big_memory partition:
+# chromap's whole point is a low memory footprint (~10-20 GB on a human genome,
+# vs ~200 GB for STAR). Everything fits on dept_cpu. Leave big_memory free.
+#
+# TOOLING MODEL: --use-conda is off — Python deps come from an activated venv
+# and binary tools (chromap, FastQC, sra-tools) from PATH. SLURM propagates the
+# submit environment (--export=ALL by default), so activate your env and put tool
+# dirs on PATH before launching (run_slurm.sh does this from $SCATAC_VENV /
+# $SCATAC_EXTRA_PATH; see README). To let Snakemake manage tools instead, set
+# use-conda: true (env specs in workflow/envs/) — untested on this cluster,
+# which has no module system.
+# =============================================================================
+
+executor: slurm
+jobs: 24                       # max concurrent SLURM jobs
+use-conda: false
+printshellcmds: true
+rerun-incomplete: true
+latency-wait: 60               # NFS: wait for outputs to appear after a job ends
+keep-going: true               # one broken sample doesn't stop the others
+# Auto-retry transient (e.g. network) failures, any rule.
+#
+# KEPT AT 3 DELIBERATELY -- but retries hide failures, so READ THE RULE LOGS.
+#
+# Snakemake's SLURM executor submits each rule as a job that RE-INVOKES
+# snakemake. A rule that fails and retries logs "Error in rule X" and "Trying to
+# restart job 0" in ITS OWN job log under
+#   .snakemake/slurm_logs/rule_<name>/<wildcards>/<jobid>.log
+# and NEVER in the controller log. So a rule looping through retries is
+# indistinguishable, from the controller log alone, from one that is working.
+#
+# Observed 2026-08-20: download_fastq failed and retried 5 times over 15 hours,
+# re-downloading 24 GB and re-extracting ~460 GB each cycle, while the controller
+# log showed only "Job 4 has been submitted". Directory size kept growing, so it
+# even looked like progress.
+#
+# WITH retries: 3, THE OPERATOR MUST:
+#   - run ./snakemake_status.sh periodically (not just at launch). It scans the
+#     rule logs and reports RUNNING-BUT-LOOPING (exit 5) when a rule has
+#     restarted >= 2 times.
+#   - treat "elapsed time far beyond expectation" as a cue to read the rule log,
+#     never as a cue to keep waiting.
+#   - never use directory size as a progress signal: re-doing work and new work
+#     grow bytes identically.
+retries: 3
+
+# Job-status polling. The default is `sacct`, which talks to slurmdbd. When that
+# accounting DB is down ("Connection refused ... :6819"), the executor can't see
+# jobs finish and the whole run hangs — even though the jobs themselves succeed.
+# `squeue` queries the controller directly (DB-independent). Requires the
+# cluster's MinJobAge to be long enough (e.g. 300s) that finished jobs linger in
+# squeue long enough to be polled. Inherited verbatim from the scRNA pipeline,
+# where this exact failure mode was hit.
+slurm-status-command: squeue
+# Don't probe slurmdbd (via sacct/sacctmgr) to guess a submit account; that probe
+# also fails when the DB is down.
+slurm-no-account: true
+
+# >>> EDIT FOR YOUR CLUSTER <<<
+# "dept_cpu" exists on the pipeline author's cluster (capricorn). Replace with a
+# partition that exists on yours (`sinfo -s` to list).
+
+# Default resources for every rule (overridden per-rule below).
+default-resources:
+  slurm_partition: "dept_cpu"
+  mem_mb: 8000
+  runtime: 720                 # minutes (12 h)
+  cpus_per_task: 2
+
+# Per-rule overrides. cpus_per_task mirrors each rule's threads: directive.
+set-threads:
+  chromap: 8
+  resolve_chromap_index: 8
+  fastqc: 2
+
+# ---------------------------------------------------------------------------
+# DISK-DRIVEN CONCURRENCY LIMIT  (the most important line in this file)
+#
+# fasterq-dump writes UNCOMPRESSED FASTQ. Measured on GSE219015/SRR28197504
+# (739M spots): 332 GB of plain FASTQ for ONE run, and the pipeline then gzips
+# it, so peak usage is uncompressed + compressed together -- roughly 400-530 GB
+# for a single sample.
+#
+# Snakemake would otherwise run many download_fastq jobs at once. Four concurrent
+# downloads of that size is ~2 TB and would fill a shared mount that already sits
+# at 99% capacity. `download_slots` caps them; raise it only if you have measured
+# headroom, not by assumption.
+resources:
+  download_slots: 1
+
+set-resources:
+  download_fastq:
+    download_slots: 1
+  resolve_chromap_index:
+    mem_mb: 64000              # chromap -i on a human genome; well under big_memory
+    cpus_per_task: 8
+    runtime: 1440              # 24 h
+  chromap:
+    mem_mb: 64000              # chromap is the low-memory aligner; 64 GB is headroom
+    cpus_per_task: 8
+    runtime: 2880              # 48 h
+  download_fastq:
+    mem_mb: 4000
+    cpus_per_task: 2
+    runtime: 1440              # ATAC FASTQs are large; allow a slow mirror
+  fastqc:
+    mem_mb: 8000
+    cpus_per_task: 2
+  detect_barcode_orientation:
+    mem_mb: 8000               # streams a read sample; whitelist is ~700k lines
+    cpus_per_task: 1
+  macs3_peaks:
+    mem_mb: 32000
+    runtime: 720
+  build_matrix:
+    mem_mb: 64000              # snapATAC2 peak x cell + TSS enrichment
+    runtime: 720
+  qc_report:
+    mem_mb: 16000
+  fragments_to_h5ad:
+    mem_mb: 32000
+  merge:
+    mem_mb: 64000              # concatenates all per-sample h5ads
+  multiqc:
+    mem_mb: 8000

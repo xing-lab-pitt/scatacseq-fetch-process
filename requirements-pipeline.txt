@@ -1,0 +1,23 @@
+# Python packages the scATAC pipeline's steps import, pinned to what is
+# actually installed in the environment the pipeline was validated in.
+# check_versions.py enforces these at preflight, so the pipeline refuses to
+# start against a drifted environment rather than failing halfway through.
+#
+# Install with uv into an existing venv (no new conda env needed):
+#   uv pip install --python $SCATAC_VENV macs3 snapatac2 pysam
+#
+# chromap is NOT here: it is a C++ tool, not a Python package. Build it from
+# source and put it on PATH via $SCATAC_EXTRA_PATH -- see README 'Install'.
+
+anndata==0.11.4
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.17.1
+h5py==3.16.0
+pysam==0.24.0
+snapatac2==2.10.0
+pyranges==0.1.4
+pyyaml==6.0.3
+polars==1.39.3
+macs3==3.0.4
+multiqc==1.35

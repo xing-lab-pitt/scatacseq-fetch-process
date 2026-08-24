@@ -1,0 +1,2 @@
+sample	srr	source	modality	genome	r1_url	r2_url	r3_url	r1_md5	r2_md5	r3_md5
+PBMC_500	SRR000001	ena	10x	GRCh38	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/001/SRR000001/SRR000001_1.fastq.gz	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/001/SRR000001/SRR000001_2.fastq.gz	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/001/SRR000001/SRR000001_3.fastq.gz	d41d8cd98f00b204e9800998ecf8427e	d41d8cd98f00b204e9800998ecf8427e	d41d8cd98f00b204e9800998ecf8427e

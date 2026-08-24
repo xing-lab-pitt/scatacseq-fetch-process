@@ -529,8 +529,9 @@ def main():
             print("  GEX sibling runs seen in this accession:")
             for srr, gsm in gex_runs[:10]:
                 print(f"    {srr:12} {gsm}")
-        print("  NOTE: the multiome path is implemented but NOT verified on real")
-        print("  multiome data -- config needs allow_unverified_multiome: true.")
+        print("  Multiome is supported. The ATAC and GEX libraries share gel beads")
+        print("  but carry different barcodes, so chromap is given a translation")
+        print("  table; the GEX siblings above go through the scRNA pipeline.")
 
     if len(by_genome) > 1:
         # `out` was never written in this case; naming it would send the user to

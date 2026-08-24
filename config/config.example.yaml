@@ -73,6 +73,7 @@ references:
     # Prebuilt-index hint, or a writable path to build+keep it at.
     chromap_index: "<PLACEHOLDER>/refdata-gex-GRCh38-2024-A/GRCh38.chromap"
     gsize: hs                     # MACS3 effective genome size
+    # Boyle Lab v2. Verify with: wc -l -> 636 regions, 227 Mb covered.
     blacklist: "<PLACEHOLDER>/blacklists/hg38-blacklist.v2.bed"
   mm10:
     # fasta + gtf: UCSC goldenPath (per scATACpipe assets/genome_ucsc.json)
@@ -82,7 +83,12 @@ references:
     gtf:   "<PLACEHOLDER>/mm10/mm10.ncbiRefSeq.gtf"
     chromap_index: "<PLACEHOLDER>/mm10/mm10.chromap"
     gsize: mm                     # ENCODE_scatac uses 1.87e9; "mm" is MACS3's alias
-    # ENCODE mm10 blacklist v2 = ENCFF547MET (per ENCODE_scatac config)
+    # Boyle Lab v2. Verify with: wc -l -> 3435 regions, 239 Mb covered.
+    #
+    # NOT the same file ENCODE_scatac uses. Its config points at ENCFF547MET,
+    # which is 164 regions covering 0.1 Mb -- an older mm10 list, and effectively
+    # no filtering. Both are real ENCODE files and both get called
+    # "the mm10 blacklist", so check the region count rather than the filename.
     blacklist: "<PLACEHOLDER>/blacklists/mm10-blacklist.v2.bed"
 
 # --- barcodes ---------------------------------------------------------------

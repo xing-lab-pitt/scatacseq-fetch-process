@@ -141,12 +141,158 @@ cd chromap && make
 export SCATAC_EXTRA_PATH=<your software dir>/chromap:/opt/FastQC:<sra-tools bin>
 ```
 
-The 10x scATAC whitelist `737K-cratac-v1.txt` is not bundled here; it ships with
-scATACpipe (`assets/whitelist_barcodes/`) and with Cell Ranger ATAC.
-
 `bedtools`, `bgzip` and `tabix` are deliberately **not** dependencies: fragment
 compression and indexing go through `pysam`, and fragments∩peaks through
 `snapATAC2`/`pyranges`.
+
+## Reference data — what you need and where to get it
+
+None of this is in the repo: the files are large, and the 10x ones are covered by
+10x's licence. Put them wherever you like and point `config.yaml` at them.
+
+Budget roughly **20 GB per genome**, most of it the chromap index.
+
+### 1. Genome FASTA + GTF
+
+Only these two files are used from any reference bundle.
+
+| Genome | Source used here | Notes |
+|---|---|---|
+| GRCh38 | 10x Cell Ranger reference **`refdata-gex-GRCh38-2024-A`** | browser download + licence acceptance; the ARC reference works equally well |
+| mm10 | UCSC `mm10.fa` + `mm10.ncbiRefSeq.gtf` | direct download, below |
+
+```bash
+# mm10 from UCSC (both links verified)
+wget https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz
+wget https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/genes/mm10.ncbiRefSeq.gtf.gz
+gunzip mm10.fa.gz mm10.ncbiRefSeq.gtf.gz     # ~2.6 GB and ~490 MB unpacked
+```
+
+**Alternatively, let a reference pipeline fetch the genome.**
+[scATACpipe](https://github.com/hukai916/scATACpipe) downloads and prepares a
+UCSC or Ensembl genome for you:
+
+```
+--ref_fasta_ucsc mm10            # or
+--ref_fasta_ensembl homo_sapiens
+```
+
+Only the FASTA and GTF it produces are needed here — the rest of its output is
+for its own workflow.
+
+**The FASTA and the GTF must use the same contig names.** A `chr`-prefixed FASTA
+against an unprefixed GTF gives zero TSS enrichment and no error message.
+
+This is subtler than "UCSC vs Ensembl". The 10x GRCh38 reference above is *built
+from* Ensembl (`Homo_sapiens.GRCh38.dna.primary_assembly.fa` + GENCODE v44) but
+10x re-prefixes the contigs, so its FASTA starts `>chr1`. Dropping a raw Ensembl
+FASTA next to the 10x GTF therefore breaks, even though both are "GRCh38". Check
+with:
+
+```bash
+head -1 <fasta>                        # >chr1 ... or >1 ...
+awk '!/^#/{print $1; exit}' <gtf>      # chr1   or 1
+```
+
+### 2. Chromap index — built, not downloaded
+
+`resolve_chromap_index` builds it from your FASTA on first use (~4 min for
+GRCh38) and records the chromap version alongside it, so an aligner upgrade
+rebuilds rather than silently reusing a stale index. Expect **~12 GB per genome**.
+
+### 3. Barcode whitelists
+
+Which one you need depends on the chemistry, and the pipeline picks between them
+from the reads:
+
+| File | Barcodes | Used for |
+|---|---|---|
+| `737K-cratac-v1.txt` | 737,280 × 16 bp | plain 10x scATAC |
+| `737K-arc-v1.ATAC.txt` | 736,320 × 16 bp | Multiome — the **ATAC** half |
+| `737K-arc-v1.txt` | 736,320 × 16 bp | Multiome — the **GEX** half |
+
+They ship inside the 10x software bundles: `737K-cratac-v1` with **Cell Ranger
+ATAC**, and the two `737K-arc-v1` files with **Cell Ranger ARC**. Both are free
+downloads from the same 10x support site.
+
+[scATACpipe](https://github.com/hukai916/scATACpipe) mirrors the scATAC one under
+`assets/whitelist_barcodes/`, as both `737K-cratac-v1.txt.gz` and a
+reverse-complemented `737K-cratac-V1-rc.txt.gz`. **You only need the forward
+file.** Some chemistries write the barcode reverse-complemented, which is why
+that second file exists elsewhere; here `detect_barcode_orientation.py` measures
+which orientation the reads use and reverse-complements the whitelist itself.
+Supplying a pre-RC'd list would double-flip it.
+
+**The two ARC files are a pair and their line order is the data.** Line *n* of the
+ATAC list and line *n* of the GEX list are the same gel bead. That correspondence
+is what `resolve_arc_translation.py` turns into chromap's `--barcode-translate`
+table — so do not sort, deduplicate or otherwise reorder either file.
+
+```yaml
+barcodes:
+  whitelist_10x:           "/refs/10x_whitelists/737K-cratac-v1.txt"
+  whitelist_multiome_atac: "/refs/10x_whitelists/737K-arc-v1.ATAC.txt"
+  whitelist_multiome_gex:  "/refs/10x_whitelists/737K-arc-v1.txt"
+```
+
+### 4. Blacklists
+
+ENCODE blacklist **v2** (Amemiya, Kundaje & Boyle, *Sci Rep* 2019), from the
+Boyle Lab repo. Small files, both links verified:
+
+```bash
+wget https://raw.githubusercontent.com/Boyle-Lab/Blacklist/master/lists/hg38-blacklist.v2.bed.gz
+wget https://raw.githubusercontent.com/Boyle-Lab/Blacklist/master/lists/mm10-blacklist.v2.bed.gz
+gunzip hg38-blacklist.v2.bed.gz mm10-blacklist.v2.bed.gz
+```
+
+**Check the region count, not the filename.** Several different files get called
+"the mm10 blacklist", they are all real ENCODE products, and the names do not
+distinguish them:
+
+| File | Regions | Covered |
+|---|---|---|
+| `hg38-blacklist.v2.bed` (v2) | 636 | 227 Mb |
+| `mm10-blacklist.v2.bed` (v2) | **3,435** | **239 Mb** |
+| ENCFF547MET — what ENCODE_scatac uses for mm10 | 164 | 0.1 Mb |
+
+```bash
+awk '{s+=$3-$2} END{printf "%d regions, %.1f Mb\n", NR, s/1e6}' <blacklist>
+```
+
+A 164-region mm10 file is effectively no filtering. It was on this machine under
+the name `mm10-blacklist.v2.bed`, which is how it went unnoticed. The v2 files
+also carry an annotation column (`High Signal Region` / `Low Mappability`); the
+older list is bare 3-column BED.
+
+Optional — omit `blacklist:` from a `references:` block and filtering is skipped.
+Worth knowing what it does and does not buy you: measured at two sequencing
+depths, the peaks it removes were **not** disproportionately strong (1.02× and
+0.96× the median). It is there for interpretability, not to improve your metrics.
+
+### Where the pipeline expects them
+
+Paths are per-genome in `config.yaml`, so one config can serve several genomes:
+
+```yaml
+references:
+  GRCh38:
+    fasta:         "/refs/refdata-gex-GRCh38-2024-A/fasta/genome.fa"
+    gtf:           "/refs/refdata-gex-GRCh38-2024-A/genes/genes.gtf"
+    chromap_index: "/refs/GRCh38.chromap"      # created on first run
+    gsize: hs
+    blacklist:     "/refs/blacklists/hg38-blacklist.v2.bed"
+  mm10:
+    fasta:         "/refs/mm10/mm10.fa"
+    gtf:           "/refs/mm10/mm10.ncbiRefSeq.gtf"
+    chromap_index: "/refs/mm10.chromap"
+    gsize: mm
+    blacklist:     "/refs/blacklists/mm10-blacklist.v2.bed"
+```
+
+`gsize` is the MACS3 effective genome size flag: `hs` for human, `mm` for mouse.
+The sheet's `genome` column selects the block, and `prepare_runs.py` fills that
+column from the organism SRA reports.
 
 ## Quickstart
 
